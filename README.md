@@ -1,11 +1,3 @@
----
-title: "Scaling an EKS Cluster with Karpenter: A Hands-On Guide with Terraform"
-published: false
-description: "Provision an EKS cluster with Terraform and let Karpenter handle node scaling. We wire up the controller, define a NodePool and EC2NodeClass, and watch nodes come and go as a real app scales."
-tags: aws, kubernetes, terraform, devops
-cover_image: ""
----
-
 # Scaling an EKS Cluster with Karpenter
 
 When a Kubernetes cluster runs out of room, something has to add nodes. For years that job belonged to the Cluster Autoscaler, which scales fixed-size node groups up and down. [Karpenter](https://karpenter.sh/) takes a different approach: it looks at the pods that can't be scheduled, works out the cheapest mix of instances that would fit them, and launches those instances directly. No pre-defined node groups to size, no guessing which instance type to standardise on.
@@ -21,35 +13,55 @@ The stack splits cleanly into two layers:
 
 ```mermaid
 flowchart TB
-    subgraph AWS["AWS Account (us-east-1)"]
-        subgraph VPC["VPC 10.0.0.0/16 · 2 AZs"]
-            subgraph EKS["EKS Cluster: CT-EKS-Cluster"]
-                MNG["Managed Node Group<br/>2x t3.medium<br/>label: karpenter.sh/controller=true"]
-                KC["Karpenter controller<br/>(Helm, kube-system)"]
-                KN["Karpenter-provisioned nodes<br/>(created on demand)"]
-                APP["nodejs-app Deployment<br/>namespace: karpenter-demo"]
+    classDef tf   fill:#efe6fb,stroke:#7b42bc,stroke-width:2px,color:#0a2540;
+    classDef iam  fill:#fde8e6,stroke:#e7352c,stroke-width:1.5px,color:#0a2540;
+    classDef k8s  fill:#e8f0fe,stroke:#326ce5,stroke-width:1.5px,color:#0a2540;
+    classDef karp fill:#e7f7ef,stroke:#1e9e5b,stroke-width:2px,color:#0a2540;
+    classDef crd  fill:#fdf3e0,stroke:#e3b96c,stroke-width:1.5px,color:#0a2540;
+    classDef ec2  fill:#fdebd3,stroke:#ec7211,stroke-width:1.5px,color:#0a2540;
+
+    TF["Terraform<br/>VPC · EKS · IAM · Helm"]:::tf
+
+    subgraph AWS["AWS Account · us-east-1"]
+        direction TB
+        PI["EKS Pod Identity<br/>+ Karpenter IAM roles"]:::iam
+        SQS["SQS interruption queue<br/>spot &amp; health events"]:::iam
+
+        subgraph VPC["VPC 10.0.0.0/16 · 2 AZs · subnets &amp; node SG tagged karpenter.sh/discovery"]
+            direction TB
+            subgraph EKS["EKS Cluster · CT-EKS-Cluster · k8s 1.36"]
+                direction TB
+                MNG["Managed Node Group<br/>2× t3.medium<br/>label karpenter.sh/controller=true"]:::k8s
+                KC["Karpenter controller<br/>Helm · kube-system"]:::karp
+
+                subgraph CRD["Karpenter resources · kubectl"]
+                    direction LR
+                    NP["NodePool<br/>instance menu · limits<br/>consolidation policy"]:::crd
+                    NC["EC2NodeClass<br/>AMI · node role · discovery tags"]:::crd
+                end
+
+                APP["nodejs-app Deployment<br/>ns karpenter-demo<br/>pinned to Karpenter nodes"]:::k8s
+                KN["Karpenter-provisioned nodes<br/>right-sized · on demand"]:::ec2
             end
-            SQS["SQS interruption queue"]
         end
-        PI["EKS Pod Identity<br/>+ IAM roles"]
     end
 
-    KC -->|watches pending pods| APP
-    KC -->|launches / removes EC2| KN
-    APP -->|scheduled onto| KN
-    SQS -->|spot & health events| KC
-    PI -->|permissions| KC
+    TF ==>|provisions| AWS
+    TF ==>|installs chart| KC
+
     MNG -->|hosts| KC
+    PI -->|permissions via Pod Identity| KC
+    SQS -->|interruption events| KC
+    NP -.->|scheduling constraints| KC
+    NC -.->|AWS launch config| KC
+
+    APP -->|1 · unschedulable pods| KC
+    KC -->|2 · launch right-sized EC2| KN
+    APP -->|3 · scheduled onto| KN
+    KC -->|4 · consolidate when idle / empty| KN
 ```
 
 The key idea: the Karpenter controller itself runs on the stable managed node group (pinned with a `nodeSelector`), while the workloads it scales land on nodes it creates. That separation keeps the controller from ever evicting itself.
-
-## Prerequisites
-
-- An AWS account and the AWS CLI configured with credentials
-- Terraform >= 1.9
-- `kubectl` and `helm`
-- An S3 bucket for Terraform state (the repo uses an S3 backend)
 
 ## Part 1: The Terraform layer
 
@@ -156,8 +168,6 @@ resource "helm_release" "karpenter" {
   depends_on = [module.eks, module.karpenter, null_resource.update_kubeconfig]
 }
 ```
-
-> **Windows / OCI tip:** pull the chart anonymously. If you pass `repository_username`/`repository_password`, the Helm provider performs an OCI `registry login` that writes to the Docker credential store, and on Windows this can fail with `could not login to OCI registry ... The stub received bad data`. A separate symptom is a `403 ... authorization token has expired` when a stale `public.ecr.aws` entry sits in `~/.docker/config.json` — clear it with `docker logout public.ecr.aws`. `public.ecr.aws` allows unauthenticated pulls, so anonymous access sidesteps both.
 
 ## Part 2: Using Karpenter from YAML
 
@@ -302,6 +312,10 @@ This creates the VPC, cluster, managed node group, Karpenter IAM roles and SQS q
 
 ```bash
 kubectl get pods -n kube-system -l app.kubernetes.io/name=karpenter
+
+NAME                         READY   STATUS    RESTARTS   AGE
+karpenter-5cdc6cdd7c-bsb7h   1/1     Running   0          29m
+karpenter-5cdc6cdd7c-hn55w   1/1     Running   0          29m
 ```
 
 **3. Register the NodePool and EC2NodeClass.**
@@ -319,6 +333,18 @@ kubectl apply -f k8s-manifests/karpenter/nodejs-app-scale.yaml
 kubectl logs -f -n kube-system -l app.kubernetes.io/name=karpenter
 kubectl get nodes -l karpenter.sh/registered=true -w
 kubectl get pods -n karpenter-demo -o wide -w
+
+$ kubectl get nodes -l karpenter.sh/registered=true
+NAME                          STATUS   ROLES    AGE    VERSION
+ip-10-0-20-105.ec2.internal   Ready    <none>   5m9s   v1.36.5-eks-577a51e
+
+$ kubectl get pods -n karpenter-demo -o wide
+NAME                          READY   STATUS    RESTARTS   AGE    IP            NODE                          NOMINATED NODE   READINESS GATES
+nodejs-app-76fb46d8cd-2r86j   1/1     Running   0          5m7s   10.0.20.219   ip-10-0-20-105.ec2.internal   <none>           <none>
+nodejs-app-76fb46d8cd-68lxb   1/1     Running   0          5m7s   10.0.20.242   ip-10-0-20-105.ec2.internal   <none>           <none>
+nodejs-app-76fb46d8cd-7s5w2   1/1     Running   0          5m7s   10.0.20.241   ip-10-0-20-105.ec2.internal   <none>           <none>
+nodejs-app-76fb46d8cd-fq692   1/1     Running   0          5m7s   10.0.20.25    ip-10-0-20-105.ec2.internal   <none>           <none>
+nodejs-app-76fb46d8cd-t8mlq   1/1     Running   0          5m7s   10.0.20.48    ip-10-0-20-105.ec2.internal   <none>           <none>
 ```
 
 **5. Scale up, then down.**
@@ -327,8 +353,31 @@ kubectl get pods -n karpenter-demo -o wide -w
 # Force more pending pods -> Karpenter adds nodes
 kubectl -n karpenter-demo scale deployment nodejs-app --replicas 15
 
+
+$ kubectl get nodes -l karpenter.sh/registered=true
+NAME                          STATUS   ROLES    AGE    VERSION
+ip-10-0-10-132.ec2.internal   Ready    <none>   21s    v1.36.5-eks-577a51e
+ip-10-0-10-17.ec2.internal    Ready    <none>   21s    v1.36.5-eks-577a51e
+ip-10-0-10-201.ec2.internal   Ready    <none>   21s    v1.36.5-eks-577a51e
+ip-10-0-10-226.ec2.internal   Ready    <none>   21s    v1.36.5-eks-577a51e
+ip-10-0-10-227.ec2.internal   Ready    <none>   20s    v1.36.5-eks-577a51e
+ip-10-0-10-230.ec2.internal   Ready    <none>   20s    v1.36.5-eks-577a51e
+ip-10-0-10-232.ec2.internal   Ready    <none>   20s    v1.36.5-eks-577a51e
+ip-10-0-10-32.ec2.internal    Ready    <none>   21s    v1.36.5-eks-577a51e
+ip-10-0-20-105.ec2.internal   Ready    <none>   7m1s   v1.36.5-eks-577a51e
+
+$ kubectl get pods -n karpenter-demo -o wide
+NAME                          READY   STATUS    RESTARTS   AGE     IP            NODE                          NOMINATED NODE   READINESS GATES
+nodejs-app-76fb46d8cd-2r86j   1/1     Running   0          7m52s   10.0.20.219   ip-10-0-20-105.ec2.internal   <none>           <none>nodejs-app-76fb46d8cd-68lxb   1/1     Running   0          7m52s   10.0.20.242   ip-10-0-20-105.ec2.internal   <none>           <none>nodejs-app-76fb46d8cd-7s5w2   1/1     Running   0          7m52s   10.0.20.241   ip-10-0-20-105.ec2.internal   <none>           <none>nodejs-app-76fb46d8cd-fq692   1/1     Running   0          7m52s   10.0.20.25    ip-10-0-20-105.ec2.internal   <none>           <none>nodejs-app-76fb46d8cd-kk5d9   1/1     Running   0          72s     10.0.10.114   ip-10-0-10-17.ec2.internal    <none>           <none>nodejs-app-76fb46d8cd-lb52g   1/1     Running   0          72s     10.0.10.100   ip-10-0-10-32.ec2.internal    <none>           <none>nodejs-app-76fb46d8cd-nxfjc   1/1     Running   0          72s     10.0.20.72    ip-10-0-20-105.ec2.internal   <none>           <none>nodejs-app-76fb46d8cd-pb4fp   1/1     Running   0          72s     10.0.10.184   ip-10-0-10-32.ec2.internal    <none>           <none>nodejs-app-76fb46d8cd-pr6v5   1/1     Running   0          72s     10.0.10.194   ip-10-0-10-17.ec2.internal    <none>           <none>nodejs-app-76fb46d8cd-rclv5   1/1     Running   0          72s     10.0.10.56    ip-10-0-10-32.ec2.internal    <none>           <none>nodejs-app-76fb46d8cd-rg7q4   1/1     Running   0          72s     10.0.10.177   ip-10-0-10-32.ec2.internal    <none>           <none>nodejs-app-76fb46d8cd-rlq5d   1/1     Running   0          72s     10.0.20.123   ip-10-0-20-105.ec2.internal   <none>           <none>nodejs-app-76fb46d8cd-snfwx   1/1     Running   0          72s     10.0.10.89    ip-10-0-10-17.ec2.internal    <none>           <none>nodejs-app-76fb46d8cd-t8mlq   1/1     Running   0          7m52s   10.0.20.48    ip-10-0-20-105.ec2.internal   <none>           <none>nodejs-app-76fb46d8cd-zl9tj   1/1     Running   0          72s     10.0.10.117   ip-10-0-10-17.ec2.internal    <none>           <none>
+
 # Remove the demand -> Karpenter consolidates and terminates empty nodes
 kubectl -n karpenter-demo scale deployment nodejs-app --replicas 0
+
+$  kubectl get pods -n karpenter-demo -o wide
+No resources found in karpenter-demo namespace.
+
+$ kubectl get nodes -l karpenter.sh/registered=true
+No resources found
 ```
 
 Within a minute or two of the scale-up you should see new `Node` objects join; after the scale-down, `consolidationPolicy: WhenEmptyOrUnderutilized` tears them back out. That full round trip is the whole point of Karpenter: capacity that tracks demand instead of a fixed, hand-tuned node group.
@@ -363,4 +412,3 @@ From here you can extend the setup with spot capacity (add `"spot"` to `karpente
 - [Karpenter NodePools](https://karpenter.sh/docs/concepts/nodepools/) and [NodeClasses](https://karpenter.sh/docs/concepts/nodeclasses/)
 - [Karpenter disruption & consolidation](https://karpenter.sh/docs/concepts/disruption/)
 - [terraform-aws-modules/eks — Karpenter sub-module](https://github.com/terraform-aws-modules/terraform-aws-eks/tree/master/modules/karpenter)
-- [EKS Pod Identities](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html)
